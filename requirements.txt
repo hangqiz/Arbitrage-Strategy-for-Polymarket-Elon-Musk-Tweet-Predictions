@@ -1,0 +1,12 @@
+# 核心依赖
+numpy>=1.22
+scipy>=1.8
+
+# 数据层 / 实例创建
+requests>=2.28
+
+# 环境变量
+python-dotenv>=0.20
+
+# 可选：Polymarket 官方 SDK（用于下单，缺失时回退到自研 REST 客户端）
+# py-clob-client>=0.49
