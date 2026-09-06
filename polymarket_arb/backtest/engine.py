@@ -111,6 +111,7 @@ class BacktestEngine:
                       days_elapsed, res):
         """入场信号：返回 (BurstState, hot_interval, x, ps) 或 None。"""
         g = self.cfg.gate; p = self.cfg.prob
+        rt = self.cfg.roundtrip
         burst_w = self.cfg.burst.burst_window_h
         baseline_days = self.cfg.burst.baseline_days
         if not ev.live[i]:
@@ -118,6 +119,10 @@ class BacktestEngine:
             return None
         if days_elapsed < g.night_day or hours_to_end <= g.settle_buffer_h:
             res.skipped_reasons.append("calendar")
+            return None
+        # 收盘前 no_entry_within_h 小时停止入场（结算前大部分区间价格持续下行）
+        if hours_to_end <= rt.no_entry_within_h:
+            res.skipped_reasons.append("near-close")
             return None
         rate = dataset.post_counts(t, burst_w) / burst_w
         base = dataset.post_counts(t, 24.0 * baseline_days) / (24.0 * baseline_days)
@@ -136,24 +141,17 @@ class BacktestEngine:
         if x <= 0:
             res.skipped_reasons.append("x<=0")
             return None
-        # ---- 入场：检测 YES 上涨趋势的终结（非机械固定回落）----
-        # 前段窗口斜率 ≥ slope_up（确在上涨），当前窗口斜率 ≤ slope_end
-        # （上涨刚结束）→ 此时 NO 接近最低，买入。全用历史数据，无前视。
-        rt = self.cfg.roundtrip
         hot_idx = market.intervals.index(hot)
-        win = rt.trend_win_m
-        cur_lo = max(0, i - win + 1)
-        prev_lo = max(0, i - 2 * win + 1)
-        try:
-            _slope_now = _slope(
-                [float(ev.probs[k, hot_idx]) * 100 for k in range(cur_lo, i + 1)])
-            _slope_prev = _slope(
-                [float(ev.probs[k, hot_idx]) * 100 for k in range(prev_lo, cur_lo)])
-        except ValueError:
-            res.skipped_reasons.append("slope-short")
+        # ---- 统一进场信号（兼容两种风格）----
+        # 热门：量大多小时缓爬/缓降（慢趋势）；其上冷门：量小价格剧烈上升（飙升）。
+        # 二者只要满足"窗口内涨幅≥min_rise 且已见顶回落"即视为过热信号。
+        # 瞬态尖峰（机器人打的 ±8¢ 单跳）因回落使 amp≈0、又不满足连续确认，自动被滤除。
+        if not self._froth_any(ev, market, hot_idx, i):
+            res.skipped_reasons.append("no-froth")
             return None
-        if not (_slope_prev >= rt.slope_up_c and _slope_now <= rt.slope_end_c):
-            res.skipped_reasons.append("no-trend-end")
+        if not all(self._froth_any(ev, market, hot_idx, i - b)
+                   for b in range(1, max(1, rt.entry_confirm_m))):
+            res.skipped_reasons.append("not-confirmed")
             return None
         ps = p_success(x, hours_to_end, p)
         if ps < p.p_min:
@@ -161,13 +159,66 @@ class BacktestEngine:
             return None
         return st, hot, x, ps
 
+    def _froth_any(self, ev, market, hot_idx: int, i: int) -> bool:
+        """热门及其上方区间中，是否存在"窗口内涨幅达标 + 已见顶回落"的过热信号。
+
+        用 hot 所在桶的份额链（hot..hot+top_k-1）逐一探测，两种风格皆识别。
+        """
+        rt = self.cfg.roundtrip
+        top = min(hot_idx + rt.leg1_top_k, len(market.intervals))
+        return any(self._froth_roll(ev, j, i) for j in range(hot_idx, top))
+
+    def _froth_roll(self, ev, idx: int, i: int) -> bool:
+        """某区间在回看窗口(froth_win_m)内是否上涨终结：
+        - 窗口内涨幅 ≥ min_rise_c（慢爬/快涨皆算）
+        - 且已从峰值回落 ≥ roll_confirm_c 或 当前段斜率 ≤0（上涨终结）。
+        全用历史数据，无前视；瞬态尖峰回落后涨幅≈0 故不命中。
+        """
+        rt = self.cfg.roundtrip
+        win = rt.froth_win_m
+        s = max(0, i - win + 1)
+        if i - s + 1 < win:
+            return False
+        vals = [float(ev.probs[k, idx]) * 100 for k in range(s, i + 1)]
+        cur = vals[-1]
+        amp = cur - vals[0]
+        if amp < rt.min_rise_c:
+            return False
+        roll = max(vals) - cur
+        if roll >= rt.roll_confirm_c:
+            return True
+        return _slope(vals) <= 0.0
+
+    def _has_spike(self, ev, hot_idx: int, i: int) -> bool:
+        """回看 spike_win_m 分钟内，是否出现 ≥spike_jump_c 的单分钟跳变。"""
+        rt = self.cfg.roundtrip
+        lo = max(1, i - rt.spike_win_m + 1)
+        for k in range(lo, i + 1):
+            jump = abs(float(ev.probs[k, hot_idx]) - float(ev.probs[k - 1, hot_idx])) * 100.0
+            if jump >= rt.spike_jump_c:
+                return True
+        return False
+
+    def _trend_end(self, ev, hot_idx: int, i: int) -> bool:
+        """YES 上涨趋势是否在 i 时刻终结：前段斜率 ≥slope_up，当前段斜率 ≤slope_end。"""
+        rt = self.cfg.roundtrip
+        win = rt.trend_win_m
+        cur_lo = max(0, i - win + 1)
+        prev_lo = max(0, i - 2 * win + 1)
+        if cur_lo - prev_lo < 2 or i - cur_lo + 1 < 2:
+            return False
+        now = _slope([float(ev.probs[k, hot_idx]) * 100 for k in range(cur_lo, i + 1)])
+        prev = _slope([float(ev.probs[k, hot_idx]) * 100 for k in range(prev_lo, cur_lo)])
+        return prev >= rt.slope_up_c and now <= rt.slope_end_c
+
     def _run_roundtrip(self, ev, dataset, existing_burst: Optional[BurstTracker] = None
                        ) -> BacktestResult:
-        """滚动出场：持仓中按 NO 涨跌触发止盈/止损，平掉后可再次入场，不等到结算。
+        """滚动出场：过热带一篮子做空，NO 上涨进入平台即止盈，平掉后可再入场。
 
-        - 入场：同四门 + 概率门槛，买热门 NO（过热做空）。
-        - 止盈/止损/结算强制平仓均按“NO 当前市值 - 成本 - 双边费用”计盈亏。
-        - 提前出场即规避「热门最终获胜」的巨额尾部损失。
+        - 入场：四门 + 概率门槛 + 趋势终结 + 尖峰过滤，买入"热门 + 其上方区间"
+          （腿1 篮子）的 NO → 做空过热区带，分散单区间最终获胜的尾部风险。
+        - 止盈：NO 加权平均已上涨 ≥rise_min_c 且进入短平台/停滞 → 抢在二次飙升前卖出。
+        - 结算：篮子内每个区间，赢家赔付 0、其余赔付 100¢。
         """
         res = BacktestResult()
         burst: BurstTracker = existing_burst or BurstTracker(self.cfg)
@@ -184,53 +235,65 @@ class BacktestEngine:
 
             if pos is not None:
                 self._apply_prices(ev, market, i)
-                # 用入场时那个桶自己的 Yes 价度量 NO 现值（而非全市场最大热门价）
-                own = market.intervals[pos["bucket_idx"]]
-                cur_no = 100.0 - own.price_c
-                pos["hist"].append(cur_no)
+                # 异常尖峰分钟不平仓（避免按人为报价成交）
+                if self._has_spike(ev, pos["hot_idx"], i):
+                    continue
+                # 篮子加权平均 NO 现值（权重=各桶份数）
+                wsum = wq = 0.0
+                for b in pos["buckets"]:
+                    cur_no = 100.0 - market.intervals[b["idx"]].price_c
+                    wsum += cur_no * b["qty"]
+                    wq += b["qty"]
+                avg_no = wsum / wq if wq > 0 else 0.0
+                pos["hist"].append(avg_no)
                 h = pos["hist"]
-                rt = self.cfg.roundtrip
-                rise = cur_no - pos["entry_no"]
+                rise = avg_no - pos["entry_no"]
                 exit_lbl = None
 
-                # ---- 止盈：已回落 + 进入平缓平台期 ----
-                if rise >= rt.rise_min_c and len(h) >= rt.plateau_win_m:
-                    win = h[-rt.plateau_win_m:]
-                    recent = max(win) - min(win)
-                    drift = win[-1] - win[0]
-                    if recent <= rt.plateau_range_c and abs(drift) <= rt.plateau_drift_c:
-                        exit_lbl = "TP"
+                # ---- 止盈：已回落 + 快速平台/停滞（抢在二次飙升前）----
+                if rise >= rt.rise_min_c:
+                    if len(h) >= rt.fast_stall_m:
+                        win = h[-rt.fast_stall_m:]
+                        if (max(win) - min(win) <= rt.fast_stall_range_c
+                                and abs(_slope(win)) <= rt.fast_slope_c):
+                            exit_lbl = "TP"
+                    if exit_lbl is None and len(h) >= rt.plateau_win_m:
+                        win = h[-rt.plateau_win_m:]
+                        recent = max(win) - min(win)
+                        drift = win[-1] - win[0]
+                        if recent <= rt.plateau_range_c and abs(drift) <= rt.plateau_drift_c:
+                            exit_lbl = "TP"
 
                 # ---- 确认式止损：真·持续走高（默认关闭）----
                 if exit_lbl is None and rt.sl_enabled:
-                    if cur_no <= pos["entry_no"] - rt.sl_enter_c:
+                    if avg_no <= pos["entry_no"] - rt.sl_enter_c:
                         if "sl_arm" not in pos:
                             pos["sl_arm"] = t
-                        # 确认期内需一直低沉（未回到 触发点+recover）
                         if t - pos["sl_arm"] >= rt.sl_dwell_m * 60:
                             exit_lbl = "SL"
                     else:
-                        pos.pop("sl_arm", None)   # 收回 → 非真跌 → 解除
+                        pos.pop("sl_arm", None)
 
                 # ---- 结算强制平仓 ----
                 if exit_lbl is None and i == last_i:
                     exit_lbl = "SETTLE"
 
                 if exit_lbl is not None:
-                    if exit_lbl in ("TP", "SL"):
-                        close_price = cur_no
-                    else:
-                        close_price = 100.0 if not pos["hot_won"] else 0.0
-                    qty = pos["qty"]
-                    cost = qty * pos["entry_no"] / 100.0
-                    proceeds = qty * close_price / 100.0
-                    # 双边手续费（买+卖）
-                    fee = qty * (self.trade_cost_c / 100.0) * 2
+                    cost = proceeds = qty_total = 0.0
+                    for b in pos["buckets"]:
+                        if exit_lbl in ("TP", "SL"):
+                            close_no = 100.0 - market.intervals[b["idx"]].price_c
+                        else:
+                            close_no = 100.0 if b["idx"] != ev.winner_bracket_idx else 0.0
+                        cost += b["qty"] * b["entry_no"] / 100.0
+                        proceeds += b["qty"] * close_no / 100.0
+                        qty_total += b["qty"]
+                    fee = qty_total * (self.trade_cost_c / 100.0) * 2
                     pnl = proceeds - cost - fee
                     res.trades.append(Trade(
                         event_slug=ev.slug, entry_time_ts=pos["entry_ts"],
                         x_c=pos["x"], p=pos["p"], hours_to_end=pos["h2end"],
-                        hot_bucket=pos["hot_bucket"], legs=[pos["leg"]],
+                        hot_bucket=pos["hot_bucket"], legs=pos["legs"],
                         budget_usd=cost, hot_won=pos["hot_won"],
                         pnl_usd=pnl, fee_usd=fee, exit=exit_lbl,
                     ))
@@ -247,19 +310,43 @@ class BacktestEngine:
                 continue
             budget = min(self.cfg.sizing.max_trade_notional_usd,
                          self.cfg.prob.risk_pct * 10_000.0)
-            no_price = max(100.0 - hot.price_c, 1.0)
-            qty = budget / (no_price / 100.0)
-            leg = Leg(leg=1, side="NO", bucket_id=hot.bucket_id,
-                      token_id=hot.no_clob_token, price_c=no_price,
-                      budget_usd=budget, quantity=qty,
-                      reason=f"滚动做空过热 x={x:.1f}¢ no={no_price:.0f}¢")
-            pos = {"entry_no": no_price, "qty": qty, "entry_ts": t, "x": x,
-                   "p": ps, "h2end": hours_to_end, "hist": [no_price],
-                   "hot_bucket": hot.bucket_id, "bucket_idx": market.intervals.index(hot),
-                   "hot_won": (ev.winner_bracket_idx == market.intervals.index(hot)),
-                   "leg": leg}
+            # ---- 腿1 篮子：热门 + 其上 top_k-1 个区间 ----
+            # 预算不平均分：量越大(价格为代理)的区间分得越多 → 精力集中在热门。
+            hi = market.intervals.index(hot)
+            top = []
+            for j in range(hi, min(hi + rt.leg1_top_k, len(market.intervals))):
+                it = market.intervals[j]
+                no_p = 100.0 - it.price_c
+                if no_p < 1.0:      # NO 已 ≈100¢，无利润空间，不进
+                    continue
+                top.append(it)
+            if not top:
+                res.skipped_reasons.append("no-basket")
+                continue
+            if rt.leg1_weight_by_price:
+                wts = [max(float(it.price_c), 1.0) for it in top]   # 预算∝价格≈量
+                span = sum(wts)
+                shares = [budget * w / span for w in wts]
+            else:
+                shares = [budget / len(top)] * len(top)
+            buckets, legs = [], []
+            for it, share in zip(top, shares):
+                no_p = max(100.0 - it.price_c, 1.0)
+                qty = share / (no_p / 100.0)
+                buckets.append({"idx": market.intervals.index(it),
+                                "bucket_id": it.bucket_id,
+                                "entry_no": no_p, "qty": qty})
+                legs.append(Leg(leg=1, side="NO", bucket_id=it.bucket_id,
+                                token_id=it.no_clob_token, price_c=no_p,
+                                budget_usd=share, quantity=qty,
+                                reason=f"做空过热带 x={x:.1f}¢ no={no_p:.0f}¢"))
+            pos = {"buckets": buckets, "legs": legs, "hist": [],
+                   "entry_no": sum(b["qty"] * b["entry_no"] for b in buckets)
+                               / sum(b["qty"] for b in buckets),
+                   "entry_ts": t, "x": x, "p": ps, "h2end": hours_to_end,
+                   "hot_bucket": hot.bucket_id, "hot_idx": hi,
+                   "hot_won": (ev.winner_bracket_idx == hi)}
             n_entries += 1
-            # 触发后才 refresh halt（避免连开）；下一轮从信号状态继续
         return res
 
     def _run_hold(self, ev, dataset, existing_burst: Optional[BurstTracker] = None
